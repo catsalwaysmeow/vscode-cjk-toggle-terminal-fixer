@@ -1,23 +1,32 @@
 #![windows_subsystem = "windows"]
 use std::{
-    env, mem, process,
-    sync::mpsc::{self, TryRecvError},
+    env, mem,
+    path::PathBuf,
+    process,
+    sync::mpsc::{self},
     thread,
-    time::Duration,
 };
 
+use anyhow::{bail, Context, Result};
 use auto_launch::AutoLaunchBuilder;
-use trayicon::{MenuBuilder, TrayIconBuilder};
+#[allow(unused_imports)]
+use tracing::{debug, error, info, trace, warn};
+use trayicon::{Icon, MenuBuilder, TrayIconBuilder};
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, WPARAM},
+    Foundation::{BOOL, HWND, LPARAM, WPARAM},
+    System::Threading::GetCurrentThreadId,
     UI::{
         Input::KeyboardAndMouse::{RegisterHotKey, MOD_CONTROL, VK_OEM_3},
         WindowsAndMessaging::{
-            DispatchMessageW, GetForegroundWindow, GetMessageW, PostMessageA, MSG, WM_HOTKEY,
-            WM_KEYDOWN, WM_KEYUP,
+            DispatchMessageW, GetForegroundWindow, GetMessageW, PostMessageA, PostThreadMessageW,
+            TranslateMessage, MSG, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
         },
     },
 };
+use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+const PACKAGE_NAME: &'static str = env!("CARGO_PKG_NAME");
+const PACKAGE_VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Event {
@@ -25,83 +34,107 @@ enum Event {
     AutoLaunch,
 }
 
-fn main() {
-    let (stop, stopped) = mpsc::channel::<()>();
-    let launch_config = AutoLaunchBuilder::new()
-        .set_app_name(env!("CARGO_PKG_NAME"))
-        .set_app_path(env::current_exe().unwrap().to_str().unwrap())
-        .set_use_launch_agent(true)
-        .build()
-        .unwrap();
-    let icon = include_bytes!("../assets/terminal_box_icon.ico");
+fn main() -> Result<()> {
+    let app_path = env::current_exe().unwrap(); // unwrap: we can do nothing here
+    let file_appender = tracing_appender::rolling::never(
+        app_path.parent().unwrap(), // unwrap: we expect the containing folder exists
+        format!("{}-{}.log", PACKAGE_NAME, PACKAGE_VERSION),
+    );
+    tracing_subscriber::fmt().with_writer(file_appender).init();
+
+    let result = logged_main(app_path);
+    if let Err(ref err) = result {
+        error!("{err:?}");
+    }
+
+    result
+}
+
+fn logged_main(app_path: PathBuf) -> Result<()> {
+    let auto_launch = app_path
+        .to_str()
+        .with_context(|| format!("non-utf8 path: {app_path:?}"))
+        .warn()
+        .and_then(|app_path| {
+            AutoLaunchBuilder::new()
+                .set_app_name(PACKAGE_NAME)
+                .set_app_path(app_path)
+                .build()
+                .warn()
+        });
     let (tx, rx) = mpsc::channel::<Event>();
-    let mut tray = TrayIconBuilder::new()
+    let mut tray: trayicon::TrayIcon<Event> = TrayIconBuilder::new()
         .sender(tx)
-        .icon_from_buffer(icon)
+        .icon(get_icon())
         .tooltip("A utility to enable ctrl+` (for Visual Studio Code) in CJK environment")
         .menu(
             MenuBuilder::new()
                 .checkable(
                     "Auto Launch",
-                    launch_config.is_enabled().unwrap(),
+                    auto_launch
+                        .as_ref()
+                        .and_then(|al| al.is_enabled().warn())
+                        .unwrap_or_default(),
                     Event::AutoLaunch,
                 )
                 .separator()
                 .item("Exit", Event::Exit),
         )
-        .build()
-        .unwrap();
+        .build()?;
 
-    thread::spawn(move || {
-        let _stop_guard = stop;
-        loop {
-            let evt = rx.recv().unwrap();
-            match evt {
-                Event::Exit => process::exit(0),
-                Event::AutoLaunch => {
-                    if launch_config.is_enabled().unwrap() {
-                        launch_config.disable().unwrap();
-                        tray.set_menu_item_checkable(Event::AutoLaunch, false)
-                            .unwrap();
-                    } else {
-                        launch_config.enable().unwrap();
-                        tray.set_menu_item_checkable(Event::AutoLaunch, true)
-                            .unwrap();
-                    }
+    let tid: u32 = unsafe { GetCurrentThreadId() };
+
+    thread::spawn(move || loop {
+        let Ok(evt) = rx.recv() else { break };
+        match evt {
+            Event::Exit => unsafe {
+                drop(tray);
+                match PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)).warn() {
+                    Some(_) => break,
+                    None => process::exit(-1),
                 }
+            },
+            Event::AutoLaunch => {
+                auto_launch.as_ref().and_then(|al| {
+                    if al.is_enabled().warn()? {
+                        al.disable().warn().and_then(|_| {
+                            tray.set_menu_item_checkable(Event::AutoLaunch, false)
+                                .warn()
+                        })
+                    } else {
+                        al.enable().warn().and_then(|_| {
+                            tray.set_menu_item_checkable(Event::AutoLaunch, true).warn()
+                        })
+                    }
+                });
             }
         }
     });
 
     unsafe {
-        let keyid = 2333;
-        let hr = RegisterHotKey(HWND(0), keyid, MOD_CONTROL, VK_OEM_3.0 as _);
-
-        if !hr.as_bool() {
-            panic!("RegisterHotKey failed")
-        }
+        const HOTKEY_ID: usize = 2333;
+        RegisterHotKey(HWND(0), HOTKEY_ID as i32, MOD_CONTROL, VK_OEM_3.0 as _)?;
 
         let mut msg: MSG = mem::zeroed();
-        while matches!(stopped.try_recv(), Err(TryRecvError::Empty)) {
-            let res = GetMessageW(&mut msg, HWND(0), 0, 0);
-
-            assert_ne!(res.0, -1);
-            if !res.as_bool() {
-                break;
-            }
-
-            if msg.message == WM_HOTKEY && msg.wParam.0 == keyid as usize {
-                mock_key()
-            } else {
-                DispatchMessageW(&msg);
+        loop {
+            match GetMessageW(&mut msg, HWND(0), 0, 0) {
+                BOOL(-1) => bail!("GetMessageW=-1: internal error"),
+                BOOL(0) => break Ok(()),
+                _success => match msg.message {
+                    WM_HOTKEY if matches!(msg.wParam, WPARAM(HOTKEY_ID)) => {
+                        forward_hotkey_message();
+                    }
+                    _unhandled_message => {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                },
             }
         }
-
-        thread::sleep(Duration::from_millis(200));
     }
 }
 
-fn mock_key() {
+fn forward_hotkey_message() {
     unsafe {
         let h_active_wnd = GetForegroundWindow();
         if matches!(h_active_wnd, HWND(0)) {
@@ -109,13 +142,68 @@ fn mock_key() {
         }
 
         for action in [WM_KEYDOWN, WM_KEYUP] {
-            println!("{action}");
             PostMessageA(
                 h_active_wnd,
                 action,
                 WPARAM(VK_OEM_3.0 as usize),
                 LPARAM(1 | 0b10 << 16),
-            );
+            )
+            .warn();
         }
+    }
+}
+
+fn get_icon() -> Icon {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let apps_use_light_theme: Option<u32> = hkcu
+        .open_subkey(r#"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"#)
+        .warn()
+        .and_then(|personalize| personalize.get_value(r#"AppsUseLightTheme"#).warn());
+
+    match apps_use_light_theme {
+        Some(1) => icon_light(),
+        _ => icon_dark(),
+    }
+}
+
+trait LogExt<T> {
+    fn warn(self) -> Option<T>;
+}
+
+impl<T, E: std::fmt::Debug> LogExt<T> for std::result::Result<T, E> {
+    fn warn(self) -> Option<T> {
+        if let Err(ref err) = self {
+            warn!("{err:?}");
+        }
+        self.ok()
+    }
+}
+
+fn icon_light() -> Icon {
+    Icon::from_buffer(
+        include_bytes!(r#"..\assets\terminal_box_icon-light.ico"#),
+        None,
+        None,
+    )
+    .unwrap() // unwrap: tested
+}
+
+fn icon_dark() -> Icon {
+    Icon::from_buffer(
+        include_bytes!(r#"..\assets\terminal_box_icon-dark.ico"#),
+        None,
+        None,
+    )
+    .unwrap() // unwrap: tested
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{icon_dark, icon_light};
+
+    #[test]
+    fn check_icons() {
+        icon_light();
+        icon_dark();
     }
 }
