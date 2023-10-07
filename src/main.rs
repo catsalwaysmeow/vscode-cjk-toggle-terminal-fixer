@@ -122,7 +122,7 @@ fn logged_main(app_path: Option<&Path>) -> Result<()> {
             }
         });
 
-        let mut msg: MSG = unsafe { mem::zeroed() }; //1
+        let mut msg: MSG = unsafe { mem::zeroed() };
         loop {
             let hr = unsafe { GetMessageW(&mut msg, HWND(0), 0, 0) };
             if matches!(hr, BOOL(0 | -1)) {
