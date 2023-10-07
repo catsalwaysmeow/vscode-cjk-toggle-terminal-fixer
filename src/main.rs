@@ -1,13 +1,7 @@
 #![windows_subsystem = "windows"]
-use std::{
-    env, mem,
-    path::PathBuf,
-    process,
-    sync::mpsc::{self},
-    thread,
-};
+use std::{env, mem, path::Path, process, sync::mpsc, thread};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use auto_launch::AutoLaunchBuilder;
 #[allow(unused_imports)]
 use tracing::{debug, error, info, trace, warn};
@@ -35,14 +29,22 @@ enum Event {
 }
 
 fn main() -> Result<()> {
-    let app_path = env::current_exe().unwrap(); // unwrap: we can do nothing here
+    let app_path = env::current_exe();
     let file_appender = tracing_appender::rolling::never(
-        app_path.parent().unwrap(), // unwrap: we expect the containing folder exists
+        app_path
+            .as_deref()
+            .ok()
+            .and_then(|app_path| app_path.parent())
+            .unwrap_or_else(|| Path::new("")),
         format!("{}-{}.log", PACKAGE_NAME, PACKAGE_VERSION),
     );
-    tracing_subscriber::fmt().with_writer(file_appender).init();
 
-    let result = logged_main(app_path);
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(file_appender)
+        .init();
+
+    let result = logged_main(app_path.as_deref().warn());
     if let Err(ref err) = result {
         error!("{err:?}");
     }
@@ -50,11 +52,23 @@ fn main() -> Result<()> {
     result
 }
 
-fn logged_main(app_path: PathBuf) -> Result<()> {
+fn logged_main(app_path: Option<&Path>) -> Result<()> {
+    const KEYID_CTRL_OEM_3: usize = 2333; // note: any value is acceptable as here we register only one hotkey.
+    unsafe {
+        RegisterHotKey(
+            HWND(0),
+            KEYID_CTRL_OEM_3 as i32,
+            MOD_CONTROL,
+            VK_OEM_3.0 as _,
+        )?;
+    }
     let auto_launch = app_path
-        .to_str()
-        .with_context(|| format!("non-utf8 path: {app_path:?}"))
-        .warn()
+        .and_then(|app_path| {
+            app_path
+                .to_str()
+                .with_context(|| format!("non-utf8 path: {app_path:?}"))
+                .warn()
+        })
         .and_then(|app_path| {
             AutoLaunchBuilder::new()
                 .set_app_name(PACKAGE_NAME)
@@ -64,77 +78,74 @@ fn logged_main(app_path: PathBuf) -> Result<()> {
         });
     let (tx, rx) = mpsc::channel::<Event>();
     let mut tray: trayicon::TrayIcon<Event> = TrayIconBuilder::new()
-        .sender(tx)
+        .sender(tx.clone())
         .icon(get_icon())
-        .tooltip("A utility to enable ctrl+` (for Visual Studio Code) in CJK environment")
+        .tooltip("Fixing the issue where 「Ctrl+`」 doesn't work with some CJK keyboards/IMEs in VSCode. ")
         .menu(
             MenuBuilder::new()
-                .checkable(
-                    "Auto Launch",
-                    auto_launch
-                        .as_ref()
-                        .and_then(|al| al.is_enabled().warn())
-                        .unwrap_or_default(),
-                    Event::AutoLaunch,
-                )
+                .when(|menu| match auto_launch.as_ref().and_then(|al|al.is_enabled().warn()) {
+                    Some(enabled) => menu.checkable("Auto Launch", enabled, Event::AutoLaunch),
+                    None => menu,
+                })
                 .separator()
                 .item("Exit", Event::Exit),
         )
         .build()?;
 
-    let tid: u32 = unsafe { GetCurrentThreadId() };
+    thread::scope(|s| -> () {
+        let tid: u32 = unsafe { GetCurrentThreadId() };
 
-    thread::spawn(move || loop {
-        let Ok(evt) = rx.recv() else { break };
-        match evt {
-            Event::Exit => unsafe {
-                drop(tray);
-                match PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)).warn() {
-                    Some(_) => break,
-                    None => process::exit(-1),
-                }
-            },
-            Event::AutoLaunch => {
-                auto_launch.as_ref().and_then(|al| {
-                    if al.is_enabled().warn()? {
-                        al.disable().warn().and_then(|_| {
-                            tray.set_menu_item_checkable(Event::AutoLaunch, false)
-                                .warn()
-                        })
-                    } else {
-                        al.enable().warn().and_then(|_| {
-                            tray.set_menu_item_checkable(Event::AutoLaunch, true).warn()
-                        })
+        s.spawn(move || loop {
+            let Ok(evt) = rx.recv() else { break };
+            match evt {
+                Event::Exit => {
+                    drop(tray); // dead lock: we MUST drop 'tray' here as it relis on the message bump of main thread.
+                    match unsafe { PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)) }.warn() {
+                        Some(_) => break,
+                        None => process::exit(-1),
                     }
-                });
+                }
+                Event::AutoLaunch => {
+                    auto_launch.as_ref().and_then(|al| {
+                        if al.is_enabled().warn()? {
+                            al.disable().warn().and_then(|_| {
+                                tray.set_menu_item_checkable(Event::AutoLaunch, false)
+                                    .warn()
+                            })
+                        } else {
+                            al.enable().warn().and_then(|_| {
+                                tray.set_menu_item_checkable(Event::AutoLaunch, true).warn()
+                            })
+                        }
+                    });
+                }
+            }
+        });
+
+        let mut msg: MSG = unsafe { mem::zeroed() };
+        loop {
+            let hr = unsafe { GetMessageW(&mut msg, HWND(0), 0, 0) };
+            if matches!(hr, BOOL(0 | -1)) {
+                // note: -1 is an error state but is also unreachable here so we don't handle it.
+                break;
+            }
+
+            match msg.message {
+                WM_HOTKEY if matches!(msg.wParam, WPARAM(KEYID_CTRL_OEM_3)) => {
+                    mock_key_press();
+                }
+                _unhandled_message => unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                },
             }
         }
     });
 
-    unsafe {
-        const HOTKEY_ID: usize = 2333;
-        RegisterHotKey(HWND(0), HOTKEY_ID as i32, MOD_CONTROL, VK_OEM_3.0 as _)?;
-
-        let mut msg: MSG = mem::zeroed();
-        loop {
-            match GetMessageW(&mut msg, HWND(0), 0, 0) {
-                BOOL(-1) => bail!("GetMessageW=-1: internal error"),
-                BOOL(0) => break Ok(()),
-                _success => match msg.message {
-                    WM_HOTKEY if matches!(msg.wParam, WPARAM(HOTKEY_ID)) => {
-                        forward_hotkey_message();
-                    }
-                    _unhandled_message => {
-                        TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
-                },
-            }
-        }
-    }
+    Ok(())
 }
 
-fn forward_hotkey_message() {
+fn mock_key_press() {
     unsafe {
         let h_active_wnd = GetForegroundWindow();
         if matches!(h_active_wnd, HWND(0)) {
