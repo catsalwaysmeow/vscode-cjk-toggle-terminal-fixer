@@ -12,8 +12,8 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::{RegisterHotKey, MOD_CONTROL, VK_OEM_3},
         WindowsAndMessaging::{
-            DispatchMessageW, GetForegroundWindow, GetMessageW, PostMessageA, PostThreadMessageW,
-            TranslateMessage, MSG, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
+            DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowTextW, PostMessageA,
+            PostThreadMessageW, TranslateMessage, MSG, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
         },
     },
 };
@@ -152,6 +152,19 @@ fn mock_key_press() {
             return;
         }
 
+        let window_title = {
+            let mut buffer = [0u16; 512];
+            let buffer_used_count = GetWindowTextW(h_active_wnd, &mut buffer) as usize;
+            String::from_utf16_lossy(&buffer[..buffer_used_count])
+        };
+
+        if !matches!(
+            window_title.rsplit(" - ").next().map(str::trim),
+            Some("Visual Studio Code" | "VS Code")
+        ) {
+            return;
+        }
+
         for action in [WM_KEYDOWN, WM_KEYUP] {
             PostMessageA(
                 h_active_wnd,
@@ -192,7 +205,7 @@ impl<T, E: std::fmt::Debug> LogExt<T> for std::result::Result<T, E> {
 
 fn icon_light() -> Icon {
     Icon::from_buffer(
-        include_bytes!(r#"..\assets\terminal_box_icon-light.ico"#),
+        include_bytes!(r#"..\assets\terminal_box_icon-light-48x48.ico"#),
         None,
         None,
     )
@@ -201,7 +214,7 @@ fn icon_light() -> Icon {
 
 fn icon_dark() -> Icon {
     Icon::from_buffer(
-        include_bytes!(r#"..\assets\terminal_box_icon-dark.ico"#),
+        include_bytes!(r#"..\assets\terminal_box_icon-dark-48x48.ico"#),
         None,
         None,
     )
