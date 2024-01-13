@@ -98,7 +98,7 @@ fn logged_main(app_path: Option<&Path>) -> Result<()> {
             let Ok(evt) = rx.recv() else { break };
             match evt {
                 Event::Exit => {
-                    drop(tray); // dead lock: we MUST drop 'tray' here as it relis on the message pump of main thread.
+                    drop(tray); // dead lock: we MUST drop 'tray' here as it relies on the message pump of main thread.
                     match unsafe { PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)) }.warn() {
                         Some(_) => break,
                         None => process::exit(-1),
