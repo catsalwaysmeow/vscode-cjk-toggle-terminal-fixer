@@ -1,0 +1,56 @@
+name: upload
+
+on:
+  push:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  build-release:
+    name: build-release
+    strategy:
+      matrix:
+        build: [windows-x86_64-msvc]
+        include:
+          - build: windows-x86_64-msvc
+            os: windows-latest
+            rust: nightly-x86_64-msvc
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+
+        # Run build
+      - name: install rustup
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > rustup-init.sh
+          sh rustup-init.sh -y --default-toolchain none
+          rustup target add ${{ matrix.target }}
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Build archive
+        shell: bash
+        run: |
+          staging="vscode-cjk-toggle-terminal-fixer_${{ matrix.build }}_${{ github.event.release.tag_name }}"
+
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/release/vscode-cjk-toggle-terminal-fixer.exe "$staging.exe"
+            echo "ASSET=$staging.exe" >> $GITHUB_ENV
+          else
+            cp target/release/vscode-cjk-toggle-terminal-fixer "$staging"
+            echo "ASSET=$staging" >> $GITHUB_ENV
+          fi
+
+      - name: Upload Release Asset
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ env.ASSET }}
+          asset_name: ${{ env.ASSET }}
+          asset_content_type: application/octet-stream
